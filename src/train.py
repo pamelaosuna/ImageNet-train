@@ -1,0 +1,162 @@
+import os
+import argparse
+import json
+from datetime import datetime
+
+import numpy as np
+import random
+
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torchvision import transforms
+from torchvision.models import alexnet
+from tqdm import tqdm
+from utils import get_imagenet_train_loader, get_imagenet_val_loader
+
+IMAGENET_TRAIN_SIZE = 1281167
+IMAGENET_VAL_SIZE = 50000
+
+def set_seed(seed):
+    """
+    Set the random seed for reproducibility.
+    """
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+def init_weights(m):
+    if isinstance(m, (nn.Conv2d, nn.Linear)):
+        nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
+        if m.bias is not None:
+            nn.init.constant_(m.bias, 0)
+
+def train_one_epoch(model, loader, criterion, optimizer, device):
+    model.train()
+    running_loss = 0.0
+    for images, targets in tqdm(loader, desc='Training', leave=False):
+        images, targets = images.to(device), targets.to(device)
+
+        optimizer.zero_grad()
+        outputs = model(images)
+        loss = criterion(outputs, targets)
+        loss.backward()
+        optimizer.step()
+
+        running_loss += loss.item() * images.size(0)
+
+    return running_loss / IMAGENET_TRAIN_SIZE
+
+def validate(model, loader, criterion, device):
+    model.eval()
+    val_loss, correct = 0.0, 0
+    with torch.no_grad():
+        for images, targets in tqdm(loader, desc='Validation', leave=False):
+            images, targets = images.to(device), targets.to(device)
+            outputs = model(images)
+            loss = criterion(outputs, targets)
+            val_loss += loss.item() * images.size(0)
+            correct += (outputs.argmax(1) == targets).sum().item()
+
+    acc = correct / IMAGENET_VAL_SIZE
+    return val_loss / IMAGENET_VAL_SIZE, acc
+
+
+def main(data_dir, save_dir, config):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # device = torch.device("mps")
+
+    train_dir = os.path.join(data_dir, 'ILSVRC2012_img_train')
+    val_tar = os.path.join(data_dir, 'ILSVRC2012_img_val.tar')
+    val_labels_file = os.path.join(data_dir, 'ILSVRC2012_validation_ground_truth.txt')
+
+    train_loader = get_imagenet_train_loader(
+        train_dir, batch_size=config["batch_size"], workers=config["workers"]
+        )
+    val_loader = get_imagenet_val_loader(
+        val_tar, val_labels_file, batch_size=config["batch_size"], workers=config["workers"]
+        )
+
+    set_seed(config["seed"])
+
+    # Initialize AlexNet
+    model = alexnet(num_classes=1000)
+    model.apply(init_weights)  # Custom init
+    model = model.to(device)
+
+    # Optimizer & loss
+    # TODO: set optimizer based on config
+    optimizer = optim.SGD(
+        model.parameters(), 
+        lr=config["lr"], 
+        momentum=config["momentum"], 
+        weight_decay=config["weight_decay"]
+        )
+    criterion = nn.CrossEntropyLoss()
+
+    # LR scheduler
+    # TODO: set scheduler based on config
+    scheduler = optim.lr_scheduler.StepLR(
+        optimizer, step_size=config["step_size"], gamma=config["gamma"])
+
+    # Training
+    epochs = config["epochs"]
+    best_val_loss = float('inf')
+    best_model_path = os.path.join(save_dir, f"best_weights.pth")
+    for epoch in range(epochs):
+        train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device)
+        val_loss, val_acc = validate(model, val_loader, criterion, device)
+        scheduler.step()
+
+        print(f"Epoch {epoch+1}/{epochs} "
+                f"Train Loss: {train_loss:.4f} Val Loss: {val_loss:.4f} Val Acc: {val_acc:.4f}")
+
+        # Save model only if val_loss improves
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            torch.save(model.state_dict(), best_model_path)
+            print(f"Model saved at epoch {epoch+1} with improved val_loss: {val_loss:.4f}")
+
+        if epoch % 19 == 0 or epoch == epochs - 1:
+            intermediate_model_path = os.path.join(save_dir, f"epoch_{epoch+1}.pth")
+            torch.save(model.state_dict(), intermediate_model_path)
+            print(f"Intermediate model saved at epoch {epoch+1}")
+
+if __name__ == "__main__":
+    argparser = argparse.ArgumentParser(description="Train AlexNet on ImageNet from scratch.")
+    argparser.add_argument('--data_dir', type=str, required=True, 
+        help='Path to ImageNet data directory')
+    argparser.add_argument('--model_subdir', type=str)
+    argparser.add_argument('--seed', type=int, default=42,
+        help='Random seed for reproducibility')
+    args = argparser.parse_args()
+
+    save_dir = os.path.join('./checkpoints', args.model_subdir)
+    os.makedirs(save_dir, exist_ok=True)
+
+    config = {
+        "epochs": 90,
+        "batch_size": 256,
+        "lr": 0.01,
+        "weight_decay": 1e-4,
+        "momentum": 0.9,
+        "seed": args.seed,
+        "initialization": "kaiming_normal",
+        "model": "alexnet",
+        "timestamp": datetime.now().strftime("%Y%m%d-%H%M%S"),
+        "optimizer": "SGD",
+        "scheduler": "StepLR",
+        "step_size": 30,
+        "gamma": 0.1,
+        "workers": 8
+    }
+    with open(os.path.join(save_dir, 'config.json'), 'w') as f:
+        json.dump(config, f, indent=4)
+
+    main(args.data_dir, save_dir=save_dir, config=config)
+
+
