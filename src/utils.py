@@ -12,7 +12,7 @@ def build_class_mapping(tar_dir):
     class_to_idx = {wnid: idx for idx, wnid in enumerate(wnids)}
     return class_to_idx
 
-def get_imagenet_train_loader(tar_dir, batch_size=256, workers=8):
+def get_imagenet_train_loader(tar_dir, batch_size=256, workers=8, debug=False, seed=42):
     class_to_idx = build_class_mapping(tar_dir)
     shards = [os.path.join(tar_dir, fname) for fname in os.listdir(tar_dir) if fname.endswith(".tar")]
 
@@ -33,15 +33,20 @@ def get_imagenet_train_loader(tar_dir, batch_size=256, workers=8):
         target = class_to_idx[wnid]
         return img, target
 
-    dataset = (
-        wds.WebDataset(shards, handler=wds.ignore_and_continue)
-        .to_tuple("jpeg", "__key__")
-        .map(preprocess)
-    )
-    # dataset = wds.WebDataset(shards, handler=wds.ignore_and_continue).decode()
-    # for sample in dataset:
-    #     print("DEBUG -- Sample keys:", sample.keys())
-    #     break
+    if debug:
+        dataset = (
+            wds.WebDataset(shards, handler=wds.ignore_and_continue)
+            .to_tuple("jpeg", "__key__")
+            .map(preprocess)
+            .slice(1000)
+        )
+    else:
+        dataset = (
+            wds.WebDataset(shards, handler=wds.ignore_and_continue, shardshuffle=1000, seed=seed)
+            .to_tuple("jpeg", "__key__")
+            .shuffle(1000)
+            .map(preprocess)
+        )
 
     loader = torch.utils.data.DataLoader(
         dataset.batched(batch_size),
@@ -58,7 +63,7 @@ def load_val_labels(val_labels_file):
     return labels
 
 
-def get_imagenet_val_loader(val_tar, val_labels_file, batch_size=256, workers=8):
+def get_imagenet_val_loader(val_tar, val_labels_file, batch_size=256, workers=8, debug=False):
     val_labels = load_val_labels(val_labels_file)
 
     transform = transforms.Compose([
@@ -70,25 +75,39 @@ def get_imagenet_val_loader(val_tar, val_labels_file, batch_size=256, workers=8)
     ])
 
     def preprocess(sample):
-        img_bytes, fname = sample
+        img_bytes, key = sample        # tuple unpacking
         img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
         img = transform(img)
-        fname = os.path.basename(sample["__key__"])
-        idx = int(fname.split("_")[-1].split(".")[0]) - 1
+
+        # get index from key, e.g. ILSVRC2012_val_00000001 → 0-based index
+        idx = int(key.split("_")[-1]) - 1
         target = val_labels[idx]
         return img, target
 
-    dataset = (
-        wds.WebDataset(val_tar)
-        .decode("rgb")
-        .to_tuple("jpg;jpeg;JPEG", "__key__")
-        .map(preprocess)
-    )
+    # # debug mode
+    # dataset = wds.WebDataset(val_tar, handler=wds.ignore_and_continue).decode()
+    # for sample in dataset:
+    #     print(f'DEBUG -- sample keys: {list(sample.keys())}')
+    #     break
 
+    if debug:
+        dataset = (
+            wds.WebDataset(val_tar, handler=wds.ignore_and_continue)
+            .to_tuple("jpeg;JPEG", "__key__")
+            .map(preprocess)
+            .slice(500)
+        )
+    else:
+        dataset = (
+            wds.WebDataset(val_tar, handler=wds.ignore_and_continue)
+            .to_tuple("jpeg;JPEG", "__key__")
+            .map(preprocess)
+        )
+        
     loader = torch.utils.data.DataLoader(
         dataset.batched(batch_size),
         batch_size=None,
-        num_workers=workers,
+        num_workers=0, # single tar file -> single worker
         pin_memory=True,
     )
     return loader

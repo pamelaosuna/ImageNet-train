@@ -66,7 +66,7 @@ def validate(model, loader, criterion, device):
     return val_loss / IMAGENET_VAL_SIZE, acc
 
 
-def main(data_dir, save_dir, config):
+def main(data_dir, save_dir, config, debug):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     # device = torch.device("mps")
 
@@ -75,10 +75,10 @@ def main(data_dir, save_dir, config):
     val_labels_file = os.path.join(data_dir, 'ILSVRC2012_validation_ground_truth.txt')
 
     train_loader = get_imagenet_train_loader(
-        train_dir, batch_size=config["batch_size"], workers=config["workers"]
+        train_dir, batch_size=config["batch_size"], workers=config["workers"], debug=debug, seed=config["seed"]
         )
     val_loader = get_imagenet_val_loader(
-        val_tar, val_labels_file, batch_size=config["batch_size"], workers=config["workers"]
+        val_tar, val_labels_file, batch_size=config["batch_size"], workers=config["workers"], debug=debug
         )
 
     set_seed(config["seed"])
@@ -133,6 +133,8 @@ if __name__ == "__main__":
     argparser.add_argument('--model_subdir', type=str)
     argparser.add_argument('--seed', type=int, default=42,
         help='Random seed for reproducibility')
+    argparser.add_argument('--debug', action='store_true',
+        help='Whether to run in debug mode')
     args = argparser.parse_args()
 
     save_dir = os.path.join('./checkpoints', args.model_subdir)
@@ -154,9 +156,15 @@ if __name__ == "__main__":
         "gamma": 0.1,
         "workers": 8
     }
+
+    if args.debug:
+        config["epochs"] = 2
+        config["batch_size"] = 16
+        config["workers"] = 0
+
     with open(os.path.join(save_dir, 'config.json'), 'w') as f:
         json.dump(config, f, indent=4)
 
-    main(args.data_dir, save_dir=save_dir, config=config)
+    main(args.data_dir, save_dir=save_dir, config=config, debug=args.debug)
 
 

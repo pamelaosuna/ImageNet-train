@@ -209,6 +209,9 @@ __marimo__/
 # Dataset
 data_ImageNet/
 
+# Checkpoints
+checkpoints/
+
 # Other
 slurm/
 out_sbatch/
