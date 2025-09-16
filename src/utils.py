@@ -35,14 +35,14 @@ def get_imagenet_train_loader(tar_dir, batch_size=256, workers=8, debug=False, s
 
     if debug:
         dataset = (
-            wds.WebDataset(shards, handler=wds.ignore_and_continue)
+            wds.WebDataset(shards, handler=wds.warn_and_continue, shardshuffle=False)
             .to_tuple("jpeg", "__key__")
             .map(preprocess)
             .slice(1000)
         )
     else:
         dataset = (
-            wds.WebDataset(shards, handler=wds.ignore_and_continue, shardshuffle=1000, seed=seed)
+            wds.WebDataset(shards, handler=wds.warn_and_continue, shardshuffle=1000, seed=seed)
             .to_tuple("jpeg", "__key__")
             .shuffle(1000)
             .map(preprocess)
@@ -52,7 +52,7 @@ def get_imagenet_train_loader(tar_dir, batch_size=256, workers=8, debug=False, s
         dataset.batched(batch_size),
         batch_size=None,
         num_workers=workers,
-        pin_memory=True,
+        pin_memory=False,
     )
     return loader
 
@@ -92,14 +92,14 @@ def get_imagenet_val_loader(val_tar, val_labels_file, batch_size=256, workers=8,
 
     if debug:
         dataset = (
-            wds.WebDataset(val_tar, handler=wds.ignore_and_continue)
+            wds.WebDataset(val_tar, handler=wds.warn_and_continue, shardshuffle=False)
             .to_tuple("jpeg;JPEG", "__key__")
             .map(preprocess)
             .slice(500)
         )
     else:
         dataset = (
-            wds.WebDataset(val_tar, handler=wds.ignore_and_continue)
+            wds.WebDataset(val_tar, handler=wds.warn_and_continue, shardshuffle=False)
             .to_tuple("jpeg;JPEG", "__key__")
             .map(preprocess)
         )
@@ -108,6 +108,6 @@ def get_imagenet_val_loader(val_tar, val_labels_file, batch_size=256, workers=8,
         dataset.batched(batch_size),
         batch_size=None,
         num_workers=0, # single tar file -> single worker
-        pin_memory=True,
+        pin_memory=False,
     )
     return loader

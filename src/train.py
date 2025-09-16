@@ -11,12 +11,13 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torchvision import transforms
-from torchvision.models import alexnet
 from tqdm import tqdm
 from utils import get_imagenet_train_loader, get_imagenet_val_loader
 
 IMAGENET_TRAIN_SIZE = 1281167
 IMAGENET_VAL_SIZE = 50000
+
+from model import get_model
 
 def set_seed(seed):
     """
@@ -29,12 +30,6 @@ def set_seed(seed):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-def init_weights(m):
-    if isinstance(m, (nn.Conv2d, nn.Linear)):
-        nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
-        if m.bias is not None:
-            nn.init.constant_(m.bias, 0)
-
 def train_one_epoch(model, loader, criterion, optimizer, device):
     model.train()
     running_loss = 0.0
@@ -45,6 +40,7 @@ def train_one_epoch(model, loader, criterion, optimizer, device):
         outputs = model(images)
         loss = criterion(outputs, targets)
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0) # gradient clipping
         optimizer.step()
 
         running_loss += loss.item() * images.size(0)
@@ -83,13 +79,11 @@ def main(data_dir, save_dir, config, debug):
 
     set_seed(config["seed"])
 
-    # Initialize AlexNet
-    model = alexnet(num_classes=1000)
-    model.apply(init_weights)  # Custom init
-    model = model.to(device)
+    # Initialize Model
+    model = get_model(config["model_name"], device)
 
     # Optimizer & loss
-    # TODO: set optimizer based on config
+    # TODO: set optimizer based on config and dependent on model, the current is for AlexNet
     optimizer = optim.SGD(
         model.parameters(), 
         lr=config["lr"], 
@@ -135,20 +129,29 @@ if __name__ == "__main__":
         help='Random seed for reproducibility')
     argparser.add_argument('--debug', action='store_true',
         help='Whether to run in debug mode')
+    argparser.add_argument('--model_name', type=str, default='alexnet',
+        choices=['alexnet', 'resnet50', 'vit_b_16'],
+        help='Model architecture to use.')
+    argparser.add_argument('--epochs', type=int, default=90,
+        help='Number of training epochs')
+    argparser.add_argument('--lr', type=float, default=0.01,
+        help='Learning rate')
+    argparser.add_argument('--batch_size', type=int, default=256,
+        help='Batch size for training and validation')
     args = argparser.parse_args()
 
     save_dir = os.path.join('./checkpoints', args.model_subdir)
     os.makedirs(save_dir, exist_ok=True)
 
     config = {
-        "epochs": 90,
-        "batch_size": 256,
-        "lr": 0.01,
+        "epochs": args.epochs,
+        "batch_size": args.batch_size,
+        "lr": args.lr,
         "weight_decay": 1e-4,
         "momentum": 0.9,
         "seed": args.seed,
         "initialization": "kaiming_normal",
-        "model": "alexnet",
+        "model_name": args.model_name,
         "timestamp": datetime.now().strftime("%Y%m%d-%H%M%S"),
         "optimizer": "SGD",
         "scheduler": "StepLR",
