@@ -12,7 +12,7 @@ def build_class_mapping(tar_dir):
     class_to_idx = {wnid: idx for idx, wnid in enumerate(wnids)}
     return class_to_idx
 
-def get_imagenet_train_loader(tar_dir, batch_size=256, workers=8, debug=False, seed=42):
+def get_imagenet_train_loader(tar_dir, batch_size=256, workers=8, debug=False):
     class_to_idx = build_class_mapping(tar_dir)
     shards = [os.path.join(tar_dir, fname) for fname in os.listdir(tar_dir) if fname.endswith(".tar")]
 
@@ -42,7 +42,7 @@ def get_imagenet_train_loader(tar_dir, batch_size=256, workers=8, debug=False, s
         )
     else:
         dataset = (
-            wds.WebDataset(shards, handler=wds.warn_and_continue, shardshuffle=1000, seed=seed)
+            wds.WebDataset(shards, handler=wds.warn_and_continue, shardshuffle=1000)
             .to_tuple("jpeg", "__key__")
             .shuffle(1000)
             .map(preprocess)

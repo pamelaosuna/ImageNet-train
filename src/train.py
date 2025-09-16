@@ -2,6 +2,7 @@ import os
 import argparse
 import json
 from datetime import datetime
+from tqdm import tqdm
 
 import numpy as np
 import random
@@ -11,37 +12,33 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torchvision import transforms
-from tqdm import tqdm
-from utils import get_imagenet_train_loader, get_imagenet_val_loader
+from torch.optim.lr_scheduler import LambdaLR
 
 IMAGENET_TRAIN_SIZE = 1281167
 IMAGENET_VAL_SIZE = 50000
 
-from model import get_model
+from utils import get_imagenet_train_loader, get_imagenet_val_loader
+from model import (
+    get_model,
+    get_optimizer,
+    get_scheduler
+    )
 
-def set_seed(seed):
-    """
-    Set the random seed for reproducibility.
-    """
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    np.random.seed(seed)
-    random.seed(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-
-def train_one_epoch(model, loader, criterion, optimizer, device):
+def train_one_epoch(model, loader, criterion, optimizer, scaler, device):
     model.train()
     running_loss = 0.0
     for images, targets in tqdm(loader, desc='Training', leave=False):
         images, targets = images.to(device), targets.to(device)
 
         optimizer.zero_grad()
-        outputs = model(images)
-        loss = criterion(outputs, targets)
-        loss.backward()
+        with torch.cuda.amp.autocast():
+            outputs = model(images)
+            loss = criterion(outputs, targets)
+
+        scaler.scale(loss).backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0) # gradient clipping
-        optimizer.step()
+        scaler.step(optimizer)
+        scaler.update()
 
         running_loss += loss.item() * images.size(0)
 
@@ -71,38 +68,30 @@ def main(data_dir, save_dir, config, debug):
     val_labels_file = os.path.join(data_dir, 'ILSVRC2012_validation_ground_truth.txt')
 
     train_loader = get_imagenet_train_loader(
-        train_dir, batch_size=config["batch_size"], workers=config["workers"], debug=debug, seed=config["seed"]
+        train_dir, batch_size=config["batch_size"], workers=config["workers"], debug=debug
         )
     val_loader = get_imagenet_val_loader(
         val_tar, val_labels_file, batch_size=config["batch_size"], workers=config["workers"], debug=debug
         )
 
-    set_seed(config["seed"])
-
     # Initialize Model
     model = get_model(config["model_name"], device)
 
     # Optimizer & loss
-    # TODO: set optimizer based on config and dependent on model, the current is for AlexNet
-    optimizer = optim.SGD(
-        model.parameters(), 
-        lr=config["lr"], 
-        momentum=config["momentum"], 
-        weight_decay=config["weight_decay"]
-        )
+    optimizer = get_optimizer(model, config)
     criterion = nn.CrossEntropyLoss()
 
     # LR scheduler
-    # TODO: set scheduler based on config
-    scheduler = optim.lr_scheduler.StepLR(
-        optimizer, step_size=config["step_size"], gamma=config["gamma"])
+    scheduler = get_scheduler(config, optimizer)
+
+    scaler = torch.cuda.amp.GradScaler()
 
     # Training
     epochs = config["epochs"]
     best_val_loss = float('inf')
     best_model_path = os.path.join(save_dir, f"best_weights.pth")
     for epoch in range(epochs):
-        train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device)
+        train_loss = train_one_epoch(model, train_loader, criterion, optimizer, scaler, device)
         val_loss, val_acc = validate(model, val_loader, criterion, device)
         scheduler.step()
 
@@ -124,41 +113,47 @@ if __name__ == "__main__":
     argparser = argparse.ArgumentParser(description="Train AlexNet on ImageNet from scratch.")
     argparser.add_argument('--data_dir', type=str, required=True, 
         help='Path to ImageNet data directory')
-    argparser.add_argument('--model_subdir', type=str)
-    argparser.add_argument('--seed', type=int, default=42,
-        help='Random seed for reproducibility')
     argparser.add_argument('--debug', action='store_true',
         help='Whether to run in debug mode')
     argparser.add_argument('--model_name', type=str, default='alexnet',
         choices=['alexnet', 'resnet50', 'vit_b_16'],
         help='Model architecture to use.')
-    argparser.add_argument('--epochs', type=int, default=90,
-        help='Number of training epochs')
-    argparser.add_argument('--lr', type=float, default=0.01,
-        help='Learning rate')
     argparser.add_argument('--batch_size', type=int, default=256,
         help='Batch size for training and validation')
+    argparser.add_argument('--workers', type=int, default=4,
+        help='Number of worker threads for data loading')
     args = argparser.parse_args()
 
-    save_dir = os.path.join('./checkpoints', args.model_subdir)
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+
+    save_dir = os.path.join('./checkpoints', f"{args.model_name}_{timestamp}")
     os.makedirs(save_dir, exist_ok=True)
 
+    # Settings for AlexNet and ResNet50
     config = {
-        "epochs": args.epochs,
+        "epochs": 90,
         "batch_size": args.batch_size,
-        "lr": args.lr,
+        "lr": 0.01,
         "weight_decay": 1e-4,
         "momentum": 0.9,
-        "seed": args.seed,
-        "initialization": "kaiming_normal",
         "model_name": args.model_name,
-        "timestamp": datetime.now().strftime("%Y%m%d-%H%M%S"),
+        "timestamp": timestamp,
         "optimizer": "SGD",
         "scheduler": "StepLR",
         "step_size": 30,
         "gamma": 0.1,
-        "workers": 8
+        "workers": args.workers,
     }
+
+    # Specific settings for ViT
+    # epochs=300, warmup_epochs=10, base_lr=5e-4, batch_size=256, weight_decay=0.05
+    if args.model_name == "vit_b_16":
+        config["epochs"] = 300
+        config["warmup_epochs"] = 10
+        config["lr"] = 5e-4 * (args.batch_size / 1024)  # linear scaling with batch size
+        config["weight_decay"] = 0.05
+        config["scheduler"] = "LambdaLR"
+        config["optimizer"] = "AdamW"
 
     if args.debug:
         config["epochs"] = 2
