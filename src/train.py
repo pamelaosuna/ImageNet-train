@@ -4,15 +4,8 @@ import json
 from datetime import datetime
 from tqdm import tqdm
 
-import numpy as np
-import random
-
-
 import torch
 import torch.nn as nn
-import torch.optim as optim
-from torchvision import transforms
-from torch.optim.lr_scheduler import LambdaLR
 
 IMAGENET_TRAIN_SIZE = 1281167
 IMAGENET_VAL_SIZE = 50000
@@ -77,20 +70,33 @@ def main(data_dir, save_dir, config, debug):
     # Initialize Model
     model = get_model(config["model_name"], device)
 
-    # Optimizer & loss
+    # Optimizer and loss
     optimizer = get_optimizer(model, config)
     criterion = nn.CrossEntropyLoss()
 
     # LR scheduler
     scheduler = get_scheduler(config, optimizer)
 
+    # Mixed precision scaler
     scaler = torch.cuda.amp.GradScaler()
+
+    # Resume checkpoint
+    start_epoch = 0
+    best_val_loss = float('inf')
+    if config.get("resume_checkpoint") and os.path.isfile(config["resume_checkpoint"]):
+        checkpoint = torch.load(config["resume_checkpoint"], map_location=device)
+        model.load_state_dict(checkpoint["model_state_dict"])
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        scaler.load_state_dict(checkpoint["scaler_state_dict"])
+        start_epoch = checkpoint["epoch"] + 1
+        best_val_loss = checkpoint.get("best_val_loss", best_val_loss)
+        print(f"Resumed from checkpoint {config['resume_checkpoint']} at epoch {start_epoch}")
 
     # Training
     epochs = config["epochs"]
-    best_val_loss = float('inf')
-    best_model_path = os.path.join(save_dir, f"best_weights.pth")
-    for epoch in range(epochs):
+    best_model_path = os.path.join(save_dir, "best_weights.pth")
+    for epoch in range(start_epoch, epochs):
         train_loss = train_one_epoch(model, train_loader, criterion, optimizer, scaler, device)
         val_loss, val_acc = validate(model, val_loader, criterion, device)
         scheduler.step()
@@ -101,12 +107,28 @@ def main(data_dir, save_dir, config, debug):
         # Save model only if val_loss improves
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            torch.save(model.state_dict(), best_model_path)
+            # torch.save(model.state_dict(), best_model_path)
+            torch.save({
+                "epoch": epoch,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
+                "scaler_state_dict": scaler.state_dict(),
+                "best_val_loss": best_val_loss
+                }, best_model_path)
             print(f"Model saved at epoch {epoch+1} with improved val_loss: {val_loss:.4f}")
 
         if epoch % 19 == 0 or epoch == epochs - 1:
             intermediate_model_path = os.path.join(save_dir, f"epoch_{epoch+1}.pth")
-            torch.save(model.state_dict(), intermediate_model_path)
+            # torch.save(model.state_dict(), intermediate_model_path)
+            torch.save({
+                "epoch": epoch,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
+                "scaler_state_dict": scaler.state_dict(),
+                "best_val_loss": best_val_loss
+                }, intermediate_model_path)
             print(f"Intermediate model saved at epoch {epoch+1}")
 
 if __name__ == "__main__":
@@ -122,6 +144,8 @@ if __name__ == "__main__":
         help='Batch size for training and validation')
     argparser.add_argument('--workers', type=int, default=4,
         help='Number of worker threads for data loading')
+    argparser.add_argument('--resume', type=str, default=None,
+        help='Path to checkpoint file to resume training from')
     args = argparser.parse_args()
 
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -143,6 +167,7 @@ if __name__ == "__main__":
         "step_size": 30,
         "gamma": 0.1,
         "workers": args.workers,
+        "resume_checkpoint": args.resume
     }
 
     # Specific settings for ViT
@@ -164,5 +189,3 @@ if __name__ == "__main__":
         json.dump(config, f, indent=4)
 
     main(args.data_dir, save_dir=save_dir, config=config, debug=args.debug)
-
-
