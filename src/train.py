@@ -17,7 +17,7 @@ from model import (
     get_scheduler
     )
 
-def train_one_epoch(model, loader, criterion, optimizer, scaler, device):
+def train_one_epoch(model, loader, criterion, optimizer, scaler, scheduler, config, device):
     model.train()
     running_loss = 0.0
     for images, targets in tqdm(loader, desc='Training', leave=False):
@@ -29,9 +29,13 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, device):
             loss = criterion(outputs, targets)
 
         scaler.scale(loss).backward()
+        scaler.unscale_(optimizer) # unscale gradients before clipping
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0) # gradient clipping
         scaler.step(optimizer)
         scaler.update()
+
+        if config['scheduler'] == 'LambdaLR':
+            scheduler.step()
 
         running_loss += loss.item() * images.size(0)
 
@@ -97,9 +101,11 @@ def main(data_dir, save_dir, config, debug):
     epochs = config["epochs"]
     best_model_path = os.path.join(save_dir, "best_weights.pth")
     for epoch in range(start_epoch, epochs):
-        train_loss = train_one_epoch(model, train_loader, criterion, optimizer, scaler, device)
+        train_loss = train_one_epoch(
+            model, train_loader, criterion, optimizer, scaler, scheduler, config, device)
         val_loss, val_acc = validate(model, val_loader, criterion, device)
-        scheduler.step()
+        if config['scheduler'] == 'StepLR':
+            scheduler.step()
 
         print(f"Epoch {epoch+1}/{epochs} "
                 f"Train Loss: {train_loss:.4f} Val Loss: {val_loss:.4f} Val Acc: {val_acc:.4f}")
