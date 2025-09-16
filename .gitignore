@@ -213,5 +213,4 @@ data_ImageNet/
 checkpoints/
 
 # Other
-slurm/
 out_sbatch/
