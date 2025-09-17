@@ -18,11 +18,20 @@ echo "loaded conda environment"
 echo "start training..."
 date
 
-OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python src/train.py \
- --data_dir data_ImageNet/ \
- --workers 8 \
- --model_name alexnet
-#  --debug
+export OMP_NUM_THREADS=1 
+export MKL_NUM_THREADS=1
+
+# python src/train.py \
+#  --data_dir data_ImageNet/ \
+#  --workers 8 \
+#  --model_name alexnet \
+# #  --debug
+
+python -u src/train_timm.py \
+ --train-data "data_ImageNet/wds-imagenet/train-{00000..00128}.tar" \
+ --val-data "data_ImageNet/wds-imagenet/val-{00000..00004}.tar" \
+ --num-workers 8 \
+ --model alexnet
 
 date
 echo "Job ended"
