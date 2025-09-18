@@ -3,11 +3,8 @@
 #SBATCH --job-name=imagenet
 #SBATCH --output=out_sbatch/%j.out
 #SBATCH --partition=gpu2
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=8
 #SBATCH --gres=gpu:1
-#SBATCH --mem-per-cpu=20G
+#SBATCH --mem=30G
 #SBATCH --time=3-00:00:00
 
 echo "load conda environment"
@@ -30,9 +27,12 @@ export MKL_NUM_THREADS=1
 python -u src/train_timm_subset.py \
  --train-data "data_ImageNet/sub50_imagenet/train" \
  --val-data "data_ImageNet/sub50_imagenet/val" \
- --num-workers 8 \
- --model alexnet \
- --class-list "src/sub50_imagenet_labels.txt"
+ --num-workers 0 \
+ --model resnet50 \
+ --class-list "src/sub50_imagenet_labels.txt" \
+#  --resume "checkpoints/alexnet_20250918-123638/best.pth" \
+#  --distributed \
+#  --world-size 2 \
 
 # python -u src/train_timm_wds.py \
 #  --train-data "data_ImageNet/wds-imagenet/train-{00000..00128}.tar" \

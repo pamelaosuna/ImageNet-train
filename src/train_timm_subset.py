@@ -2,17 +2,22 @@ import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.distributed as dist
+import torch.multiprocessing as mp
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Subset
+from torch.utils.data.distributed import DistributedSampler
 from torchvision import datasets, transforms
 import timm
 from timm.data import create_transform
 from timm.scheduler import create_scheduler
 from timm.optim import create_optimizer
-from timm.utils import AverageMeter, accuracy
+from timm.utils import AverageMeter, accuracy, reduce_tensor
 import argparse
 from pathlib import Path
 import time
 import json
+import math
 
 from torchvision.models import alexnet
 
@@ -33,7 +38,10 @@ class ImageNetSubsetDataset(datasets.ImageFolder):
             print(f"Warning: These classes not found in dataset: {missing_classes}")
             self.selected_classes = [cls for cls in class_list if cls in self.original_class_to_idx]
         
-        print(f"Using {len(self.selected_classes)} classes out of {len(class_list)} requested")
+        if dist.is_initialized() and dist.get_rank() == 0:
+            print(f"Using {len(self.selected_classes)} classes out of {len(class_list)} requested")
+        elif not dist.is_initialized():
+            print(f"Using {len(self.selected_classes)} classes out of {len(class_list)} requested")
         
         # Create new class mapping (0 to num_selected_classes-1)
         self.class_to_idx = {cls: idx for idx, cls in enumerate(self.selected_classes)}
@@ -45,7 +53,10 @@ class ImageNetSubsetDataset(datasets.ImageFolder):
         # Filter samples to only include selected classes
         self.samples = self._filter_samples()
         
-        print(f"Dataset created with {len(self.samples)} samples from {len(self.selected_classes)} classes")
+        if dist.is_initialized() and dist.get_rank() == 0:
+            print(f"Dataset created with {len(self.samples)} samples from {len(self.selected_classes)} classes")
+        elif not dist.is_initialized():
+            print(f"Dataset created with {len(self.samples)} samples from {len(self.selected_classes)} classes")
     
     def _filter_samples(self):
         """Filter samples to only include selected classes"""
@@ -158,7 +169,22 @@ class WarmupCosineScheduler:
         
         return lr
 
-def train_epoch(model, loader, criterion, optimizer, device, epoch, clipping, mixup_fn):
+def setup_distributed(rank, world_size, port=12355):
+    """Setup distributed training"""
+    os.environ['MASTER_ADDR'] = 'localhost'
+    os.environ['MASTER_PORT'] = str(port)
+    
+    # Initialize the process group
+    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+    
+    # Set device for this process
+    torch.cuda.set_device(rank)
+
+def cleanup_distributed():
+    """Clean up distributed training"""
+    dist.destroy_process_group()
+
+def train_epoch(model, loader, criterion, optimizer, device, epoch, clipping, mixup_fn, distributed=False):
     """Train for one epoch"""
     model.train()
     
@@ -191,16 +217,28 @@ def train_epoch(model, loader, criterion, optimizer, device, epoch, clipping, mi
         # Metrics
         if mixup_fn is None:
             acc1, acc5 = accuracy(outputs, targets, topk=(1, 5))
+            
+            # For distributed training, we need to reduce metrics across processes
+            if distributed:
+                loss = reduce_tensor(loss, dist.get_world_size())
+                acc1 = reduce_tensor(acc1, dist.get_world_size())
+                acc5 = reduce_tensor(acc5, dist.get_world_size())
+            
             losses.update(loss.item(), images.size(0))
             top1.update(acc1.item(), images.size(0))
             top5.update(acc5.item(), images.size(0))
         else:
+            # For distributed training, reduce loss
+            if distributed:
+                loss = reduce_tensor(loss, dist.get_world_size())
+            
             losses.update(loss.item(), images.size(0))
             # For mixup, we can't compute exact accuracy
             top1.update(0.0, images.size(0))
             top5.update(0.0, images.size(0))
         
-        if batch_idx % 100 == 0:
+        # Only print from rank 0 in distributed training
+        if batch_idx % 100 == 0 and (not distributed or dist.get_rank() == 0):
             print(f'Epoch: {epoch + 1} [{batch_idx:>4d}] '
                   f'Loss: {losses.val:.4f} ({losses.avg:.4f}) '
                   f'Acc@1: {top1.val:.2f} ({top1.avg:.2f}) '
@@ -208,7 +246,7 @@ def train_epoch(model, loader, criterion, optimizer, device, epoch, clipping, mi
     
     return losses.avg, top1.avg, top5.avg
 
-def validate(model, loader, criterion, device):
+def validate(model, loader, criterion, device, distributed=False):
     """Validate the model"""
     model.eval()
     
@@ -227,12 +265,21 @@ def validate(model, loader, criterion, device):
             
             # Metrics
             acc1, acc5 = accuracy(outputs, targets, topk=(1, 5))
+            
+            # For distributed training, reduce metrics across processes
+            if distributed:
+                loss = reduce_tensor(loss, dist.get_world_size())
+                acc1 = reduce_tensor(acc1, dist.get_world_size())
+                acc5 = reduce_tensor(acc5, dist.get_world_size())
+            
             losses.update(loss.item(), images.size(0))
             top1.update(acc1.item(), images.size(0))
             top5.update(acc5.item(), images.size(0))
     
-    print(f'Validation: Loss: {losses.avg:.4f} '
-          f'Acc@1: {top1.avg:.2f} Acc@5: {top5.avg:.2f}')
+    # Only print from rank 0 in distributed training
+    if not distributed or dist.get_rank() == 0:
+        print(f'Validation: Loss: {losses.avg:.4f} '
+              f'Acc@1: {top1.avg:.2f} Acc@5: {top5.avg:.2f}')
     
     return losses.avg, top1.avg, top5.avg
 
@@ -268,37 +315,64 @@ def create_config(args):
         },
         'system': {
             'num_workers': args.num_workers,
-            'output_dir': args.output_dir
+            'output_dir': args.output_dir,
+            'distributed': args.distributed,
+            'world_size': args.world_size
         }
     }
     return config
 
-def main(args):
-    # Load class list
-    print(f"Loading class list from: {args.class_list}")
-    class_names = load_class_list_from_file(args.class_list)
-    args.num_classes = len(class_names)
-    print(f"Training on {args.num_classes} classes")
-
-    # Create output directory
-    timestamp = time.strftime('%Y%m%d-%H%M%S')
-    output_dir = os.path.join(args.output_dir, f'{args.model}_{timestamp}')
-    os.makedirs(output_dir, exist_ok=True)
+def run_training(rank, world_size, args):
+    """Main training function for distributed training"""
+    # Setup distributed training if using multiple GPUs
+    distributed = world_size > 1
+    if distributed:
+        setup_distributed(rank, world_size, args.port)
     
     # Device setup
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f'Using device: {device}')
+    if distributed:
+        device = torch.device(f'cuda:{rank}')
+    else:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    if rank == 0:
+        print(f'Using device: {device}')
+        if distributed:
+            print(f'Distributed training on {world_size} GPUs')
+    
+    # Load class list
+    if rank == 0:
+        print(f"Loading class list from: {args.class_list}")
+    class_names = load_class_list_from_file(args.class_list)
+    args.num_classes = len(class_names)
+    if rank == 0:
+        print(f"Training on {args.num_classes} classes")
 
-    # Save config
-    config = create_config(args)
-    with open(os.path.join(output_dir, 'config.json'), 'w') as f:
-        json.dump(config, f, indent=4)
+    # Create output directory (only on rank 0)
+    if rank == 0:
+        timestamp = time.strftime('%Y%m%d-%H%M%S')
+        output_dir = os.path.join(args.output_dir, f'{args.model}_{timestamp}')
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Save config
+        config = create_config(args)
+        with open(os.path.join(output_dir, 'config.json'), 'w') as f:
+            json.dump(config, f, indent=4)
+    else:
+        output_dir = None
+    
+    # Broadcast output_dir to all processes
+    if distributed:
+        output_dir_list = [output_dir]
+        dist.broadcast_object_list(output_dir_list, src=0)
+        output_dir = output_dir_list[0]
 
     # Create transforms
     train_transform, val_transform = create_transforms(vit=(args.model.startswith('vit')))
     
     # Create datasets
-    print('Creating datasets...')
+    if rank == 0:
+        print('Creating datasets...')
     train_dataset = ImageNetSubsetDataset(
         args.train_data, 
         class_names, 
@@ -311,24 +385,44 @@ def main(args):
         transform=val_transform
     )
 
+    # Create samplers for distributed training
+    train_sampler = None
+    val_sampler = None
+    if distributed:
+        train_sampler = DistributedSampler(
+            train_dataset, 
+            num_replicas=world_size, 
+            rank=rank,
+            shuffle=True
+        )
+        val_sampler = DistributedSampler(
+            val_dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=False
+        )
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        pin_memory=True
+        shuffle=(train_sampler is None),  # Don't shuffle if using DistributedSampler
+        sampler=train_sampler,
+        num_workers=args.num_workers,  # Set to 0 to avoid multiprocessing issues
+        pin_memory=False
     )
     
     val_loader = DataLoader(
         val_dataset,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=True
+        sampler=val_sampler,
+        num_workers=args.num_workers,  # Set to 0 to avoid multiprocessing issues
+        pin_memory=False
     )
     
     # Create model
-    print(f'Creating model: {args.model}')
+    if rank == 0:
+        print(f'Creating model: {args.model}')
     if args.model == 'alexnet':
         # not available in timm, use torchvision
         model = alexnet(
@@ -351,7 +445,16 @@ def main(args):
         )
     model = model.to(device)
     
-    print(f'Model parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M')
+    # Wrap model for distributed training
+    if distributed:
+        model = DDP(model, device_ids=[rank])
+    elif torch.cuda.device_count() > 1 and not distributed:
+        # Use DataParallel if multiple GPUs but not using distributed
+        model = nn.DataParallel(model)
+    
+    if rank == 0:
+        param_count = sum(p.numel() for p in model.parameters()) / 1e6
+        print(f'Model parameters: {param_count:.2f}M')
     
     # Loss function
     if args.label_smoothing:
@@ -373,20 +476,22 @@ def main(args):
             label_smoothing=0.1,
             num_classes=args.num_classes
         )
-        print(f'Using Mixup (alpha={args.mixup}) and CutMix (alpha={args.cutmix})')
+        if rank == 0:
+            print(f'Using Mixup (alpha={args.mixup}) and CutMix (alpha={args.cutmix})')
     
-    # Optimizer
+    # Optimizer - scale learning rate for distributed training
+    lr = args.lr * world_size if distributed else args.lr
     if args.optimizer == 'sgd':
         optimizer = optim.SGD(
             model.parameters(),
-            lr=args.lr,
+            lr=lr,
             momentum=args.momentum,
             weight_decay=args.weight_decay
         )
     elif args.optimizer == 'adamw':
         optimizer = optim.AdamW(
             model.parameters(),
-            lr=args.lr,
+            lr=lr,
             weight_decay=args.weight_decay,
             betas=args.betas
         )
@@ -401,17 +506,11 @@ def main(args):
             gamma=args.gamma
         )
     elif args.scheduler == 'cosine':
-        # # Cosine annealing scheduler
-        # scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        #     optimizer,
-        #     T_max=args.epochs,
-        #     eta_min=1e-6
-        # )
         scheduler = WarmupCosineScheduler(
             optimizer,
             warmup_epochs=10,
             max_epochs=args.epochs,
-            base_lr=args.lr,
+            base_lr=lr,
             min_lr=1e-6
         )
     else:
@@ -422,30 +521,39 @@ def main(args):
     best_acc1 = 0
 
     if args.resume and os.path.isfile(args.resume):
-        print(f'Loading checkpoint from {args.resume}')
+        if rank == 0:
+            print(f'Loading checkpoint from {args.resume}')
         checkpoint = torch.load(args.resume, map_location=device)
-        model.load_state_dict(checkpoint['state_dict'])
+        
+        # Handle DDP state dict loading
+        model_to_load = model.module if hasattr(model, 'module') else model
+        model_to_load.load_state_dict(checkpoint['state_dict'])
+        
         optimizer.load_state_dict(checkpoint['optimizer'])
-        scheduler.load_state_dict(checkpoint['scheduler'])
         start_epoch = checkpoint['epoch'] + 1
         best_acc1 = checkpoint.get('best_acc1', 0)
     
-    if args.resume is None:
-        # save network before training
+    if args.resume is None and rank == 0:
+        # save network before training (only on rank 0)
+        model_to_save = model.module if hasattr(model, 'module') else model
         torch.save({
             'epoch': 0,
             'model': args.model,
-            'state_dict': model.state_dict(),
+            'state_dict': model_to_save.state_dict(),
             'best_acc1': best_acc1,
             'optimizer': optimizer.state_dict(),
-            'scheduler': scheduler.state_dict(),
             'args': args,
         }, os.path.join(output_dir, 'initial.pth'))
 
     # Training loop
     for epoch in range(start_epoch, args.epochs):
-        print(f'\nEpoch {epoch+1}/{args.epochs}')
-        print('-' * 50)
+        # Set epoch for distributed sampler
+        if distributed and train_sampler is not None:
+            train_sampler.set_epoch(epoch)
+        
+        if rank == 0:
+            print(f'\nEpoch {epoch+1}/{args.epochs}')
+            print('-' * 50)
 
         # Cosine annealing scheduler step at start of epoch
         if args.scheduler == 'cosine':
@@ -455,47 +563,68 @@ def main(args):
         train_loss, train_acc1, train_acc5 = train_epoch(
             model, train_loader, criterion, optimizer, device, epoch,
             clipping=(args.model.startswith('vit')),
-            mixup_fn=mixup_fn
+            mixup_fn=mixup_fn,
+            distributed=distributed
         )
         
         # Validate
         val_loss, val_acc1, val_acc5 = validate(
-            model, val_loader, criterion, device
+            model, val_loader, criterion, device, distributed=distributed
         )
         
         # Update scheduler
         if args.scheduler == 'steplr':
             scheduler.step()
         
-        # Save checkpoint
-        is_best = val_acc1 > best_acc1
-        best_acc1 = max(val_acc1, best_acc1)
-        
-        checkpoint = {
-            'epoch': epoch,
-            'model': args.model,
-            'state_dict': model.state_dict(),
-            'best_acc1': best_acc1,
-            'optimizer': optimizer.state_dict(),
-            'scheduler': scheduler.state_dict(),
-            'args': args,
-        }
-        
-        # # Save latest checkpoint
-        # torch.save(checkpoint, os.path.join(output_dir, 'latest.pth'))
-        
-        # Save best checkpoint
-        if is_best:
-            torch.save(checkpoint, os.path.join(output_dir, 'best.pth'))
+        # Save checkpoint (only from rank 0)
+        if rank == 0:
+            is_best = val_acc1 > best_acc1
+            best_acc1 = max(val_acc1, best_acc1)
+            
+            # Get the actual model (unwrap DDP if necessary)
+            model_to_save = model.module if hasattr(model, 'module') else model
+            
+            checkpoint = {
+                'epoch': epoch,
+                'model': args.model,
+                'state_dict': model_to_save.state_dict(),
+                'best_acc1': best_acc1,
+                'optimizer': optimizer.state_dict(),
+                'args': args,
+            }
+            
+            # Save best checkpoint
+            if is_best:
+                torch.save(checkpoint, os.path.join(output_dir, 'best.pth'))
 
-        # Save every 10 epochs
-        if (epoch + 1) % 10 == 0 or epoch == 0 or epoch == args.epochs - 1:
-            torch.save(checkpoint, os.path.join(output_dir, f'epoch_{epoch+1}.pth'))
-        
-        print(f'Best Acc@1: {best_acc1:.2f}')
+            # Save every 10 epochs
+            if (epoch + 1) % 10 == 0 or epoch == 0 or epoch == args.epochs - 1:
+                torch.save(checkpoint, os.path.join(output_dir, f'epoch_{epoch+1}.pth'))
+            
+            print(f'Best Acc@1: {best_acc1:.2f}')
+    
+    # Clean up distributed training
+    if distributed:
+        cleanup_distributed()
+
+def main(args):
+    # Auto-detect world size if not specified
+    if args.world_size == -1:
+        args.world_size = torch.cuda.device_count()
+    
+    # Run training
+    if args.distributed and args.world_size > 1:
+        if args.world_size > torch.cuda.device_count():
+            print(f"Error: Requested {args.world_size} GPUs but only {torch.cuda.device_count()} available")
+            return
+        print(f'Starting distributed training on {args.world_size} GPUs')
+        mp.spawn(run_training, args=(args.world_size, args), nprocs=args.world_size)
+    else:
+        # Single GPU training
+        run_training(0, 1, args)
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Train network on ImageNet with WebDataset')
+    parser = argparse.ArgumentParser(description='Train network on ImageNet subset with multi-GPU support')
     
     # Data arguments
     parser.add_argument('--train-data', required=True, 
@@ -519,7 +648,7 @@ if __name__ == '__main__':
     parser.add_argument('--epochs', type=int, default=90,
                        help='Number of epochs')
     parser.add_argument('--batch-size', type=int, default=256,
-                       help='Batch size')
+                       help='Batch size per GPU')
     parser.add_argument('--lr', type=float, default=0.01,
                        help='Learning rate')
     parser.add_argument('--weight-decay', type=float, default=5e-4,
@@ -540,10 +669,22 @@ if __name__ == '__main__':
                         help='Use label smoothing in loss function')
     parser.add_argument('--use_mixup', action='store_true',
                         help='Use mixup augmentation')
+    parser.add_argument('--mixup', type=float, default=0.8,
+                       help='Mixup alpha')
+    parser.add_argument('--cutmix', type=float, default=1.0,
+                       help='CutMix alpha')
+    
+    # Distributed training arguments
+    parser.add_argument('--distributed', action='store_true',
+                       help='Use distributed training')
+    parser.add_argument('--world-size', type=int, default=-1,
+                       help='Number of GPUs to use for distributed training')
+    parser.add_argument('--port', type=int, default=12355,
+                       help='Port for distributed training')
             
     # System arguments
-    parser.add_argument('--num-workers', type=int, default=4,
-                       help='Number of data loading workers')
+    parser.add_argument('--num-workers', type=int, default=0,
+                       help='Number of data loading workers (set to 0 to avoid multiprocessing issues)')
     parser.add_argument('--output-dir', default='./checkpoints',
                        help='Directory to save checkpoints')
     
