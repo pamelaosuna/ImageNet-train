@@ -2,7 +2,8 @@ import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
+from torchvision import datasets, transforms
 import timm
 from timm.data import create_transform
 from timm.scheduler import create_scheduler
@@ -240,7 +241,8 @@ def create_config(args):
     config = {
         'data': {
             'train_data': args.train_data,
-            'val_data': args.val_data
+            'val_data': args.val_data,
+            'class_list': args.class_list,
         },
         'model': {
             'name': args.model,
@@ -275,8 +277,8 @@ def main(args):
     # Load class list
     print(f"Loading class list from: {args.class_list}")
     class_names = load_class_list_from_file(args.class_list)
-    num_classes = len(class_names)
-    print(f"Training on {num_classes} classes")
+    args.num_classes = len(class_names)
+    print(f"Training on {args.num_classes} classes")
 
     # Create output directory
     timestamp = time.strftime('%Y%m%d-%H%M%S')
@@ -331,19 +333,19 @@ def main(args):
         # not available in timm, use torchvision
         model = alexnet(
             pretrained=args.pretrained, 
-            num_classes=num_classes
+            num_classes=args.num_classes
         )
     elif args.model == 'resnet50':
         model = timm.create_model(
             args.model, 
             pretrained=args.pretrained,
-            num_classes=num_classes
+            num_classes=args.num_classes
         )
     elif args.model.startswith('vit'):
         model = timm.create_model(
             args.model,
             pretrained=args.pretrained,
-            num_classes=num_classes,
+            num_classes=args.num_classes,
             drop_rate=0.1,
             drop_path_rate=0.1
         )
@@ -427,6 +429,18 @@ def main(args):
         scheduler.load_state_dict(checkpoint['scheduler'])
         start_epoch = checkpoint['epoch'] + 1
         best_acc1 = checkpoint.get('best_acc1', 0)
+    
+    if args.resume is None:
+        # save network before training
+        torch.save({
+            'epoch': 0,
+            'model': args.model,
+            'state_dict': model.state_dict(),
+            'best_acc1': best_acc1,
+            'optimizer': optimizer.state_dict(),
+            'scheduler': scheduler.state_dict(),
+            'args': args,
+        }, os.path.join(output_dir, 'initial.pth'))
 
     # Training loop
     for epoch in range(start_epoch, args.epochs):
